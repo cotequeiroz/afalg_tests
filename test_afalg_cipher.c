@@ -195,8 +195,10 @@ int main(int argc, char **argv)
       if (n < vectors[t].len) {
         /* rfc3863-mode ciphers are not updating IV on their own,
 	 * so they can't do the operation using partial updates */
+#ifndef AFALG_RFC3686_UPDATE_TEST
         if (!strncmp(vectors[t].alg, "rfc3686(", 8))
 	  break;
+#endif
 	printf("Running using %d-byte updates\n", n);
       } else {
 	printf("Running in one-shot\n");
