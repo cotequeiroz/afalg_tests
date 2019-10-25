@@ -954,7 +954,9 @@ static struct test_vector_st vectors[] = {
 		  "\xD7\x07\x8A\xD7\x18\x92\x36\x8C"
 		  "\x82\xA9\xBD\x6A\x31\x91\x39\x11"
 		  "\xC6\x4A\xF3\x55\xC7\x29\x2E\x63",
-  }, {
+  },
+#ifdef AFALG_UNNOFICIAL_TESTS
+  {
     .desc	= "Unnoficial test, from RFC3686#5: 32 bytes using 3DES-CBC",
     .alg	= "cbc(des3_ede)",
     .blocklen	= 8,
@@ -991,5 +993,6 @@ static struct test_vector_st vectors[] = {
 		  "\x02\xb7\x5d\x83\x98\xe8\x5a\xe3"
 		  "\x32\x24\xa5\x96\x96\xc6\xcb\x4c",
   },
+#endif
   { 0 },
 };
