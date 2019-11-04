@@ -1,6 +1,7 @@
 CC:=gcc
 CFLAGS:=-g -Og
+PROGS:=test_afalg_cipher
 
-all: test_afalg_cipher
+all: $(PROGS)
 clean:
-	rm -f test_afalg_cipher
+	rm -f $(PROGS)

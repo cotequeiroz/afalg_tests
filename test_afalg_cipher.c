@@ -1,7 +1,9 @@
+#include <errno.h>
 #include <stdint.h>
 #include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <linux/cryptouser.h>
 #include <linux/if_alg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -11,8 +13,8 @@
 #include "test_vectors.h"
 
 struct afalg_ctx_st {
-  struct sockaddr_alg sa;
-  int sfd, bfd;
+  int sfd, bfd, enc;
+  size_t tlen;
 };
 typedef struct afalg_ctx_st afalg_ctx;
 
@@ -23,9 +25,10 @@ static void PrintHex(FILE *stream, const char *text, size_t text_len)
 }
 
 static int CipherInit(afalg_ctx *ctx, const char *alg_name, const char *key,
-		      size_t keylen, const char *iv, size_t ivlen, int enc)
+		      size_t keylen, const char *iv, size_t ivlen, size_t tlen,
+		      unsigned int aadlen, int enc)
 {
-  struct sockaddr_alg sa;
+  struct sockaddr_alg sa = { 0 };
   struct msghdr msg = { 0 };
   struct cmsghdr *cmsg;
   struct af_alg_iv *aiv;
@@ -33,11 +36,11 @@ static int CipherInit(afalg_ctx *ctx, const char *alg_name, const char *key,
   int op = enc ? ALG_OP_ENCRYPT : ALG_OP_DECRYPT;
   size_t set_op_len = sizeof op;
   size_t set_iv_len = offsetof(struct af_alg_iv, iv) + ivlen;
-  char buf[CMSG_SPACE(set_op_len) + CMSG_SPACE(set_iv_len)];
+  char buf[CMSG_SPACE(set_op_len) + CMSG_SPACE(set_iv_len)
+	   + CMSG_SPACE(sizeof aadlen)];
 
-  memset(&sa, 0, sizeof ctx->sa);
   sa.salg_family = AF_ALG;
-  strcpy(sa.salg_type, "skcipher");
+  strcpy(sa.salg_type, tlen == 0 ? "skcipher" : "aead");
   strncpy(sa.salg_name, alg_name, sizeof sa.salg_name);
   if (( ctx->bfd = socket(AF_ALG, SOCK_SEQPACKET, 0)) < 0) {
     perror("Failed to open socket");
@@ -50,36 +53,60 @@ static int CipherInit(afalg_ctx *ctx, const char *alg_name, const char *key,
   }
   if (setsockopt(ctx->bfd, SOL_ALG, ALG_SET_KEY, key, keylen) < 0) {
     perror("Failed to set key");
+    goto err;
+  }
+  if (tlen > 0 && setsockopt(ctx->bfd, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL,
+			     tlen) < 0) {
+    perror("Failed to set authentication tag length");
+    goto err;
   }
   if ((ctx->sfd = accept(ctx->bfd, NULL, 0)) < 0) {
     perror("Socket accept failed");
     goto err;
   }
+  ctx->tlen = tlen;
+  ctx->enc = enc;
   memset(&buf, 0, sizeof buf);
   msg.msg_control = buf;
   /* set op */
-  msg.msg_controllen = CMSG_SPACE(set_op_len);
+  msg.msg_controllen = CMSG_SPACE(set_op_len)
+		       + (ivlen > 0 ? CMSG_SPACE(set_iv_len) : 0)
+		       + (aadlen > 0 ? CMSG_SPACE(sizeof aadlen) : 0);
   cmsg = CMSG_FIRSTHDR(&msg);
+  if (cmsg == NULL)
+    goto err;
   cmsg->cmsg_level = SOL_ALG;
   cmsg->cmsg_type = ALG_SET_OP;
   cmsg->cmsg_len = CMSG_LEN(set_op_len);
-  memcpy(CMSG_DATA(cmsg), &op, sizeof op);
+  *(CMSG_DATA(cmsg)) = op;
   /* set IV */
-  msg.msg_controllen += CMSG_SPACE(set_iv_len);
-  cmsg = CMSG_NXTHDR(&msg, cmsg);
-  cmsg->cmsg_level = SOL_ALG;
-  cmsg->cmsg_type = ALG_SET_IV;
-  cmsg->cmsg_len = CMSG_LEN(set_iv_len);
-  aiv = (void *)CMSG_DATA(cmsg);
-  aiv->ivlen = ivlen;
-  memcpy(aiv->iv, iv, ivlen);
-
+  if (ivlen > 0) {
+    cmsg = CMSG_NXTHDR(&msg, cmsg);
+    if (cmsg == NULL)
+      goto err;
+    cmsg->cmsg_level = SOL_ALG;
+    cmsg->cmsg_type = ALG_SET_IV;
+    cmsg->cmsg_len = CMSG_LEN(set_iv_len);
+    aiv = (void *)CMSG_DATA(cmsg);
+    aiv->ivlen = ivlen;
+    memcpy(aiv->iv, iv, ivlen);
+  }
+  if (aadlen > 0) {
+    cmsg = CMSG_NXTHDR(&msg, cmsg);
+    if (cmsg == NULL)
+      goto err;
+    cmsg->cmsg_level = SOL_ALG;
+    cmsg->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
+    cmsg->cmsg_len = CMSG_LEN(sizeof aadlen);
+    *(CMSG_DATA(cmsg)) = aadlen;
+  }
   iov.iov_base = NULL;
   iov.iov_len = 0;
-  if (sendmsg(ctx->sfd, &msg, 0) < 0) {
-    fprintf(stderr, "sendmsg: Failed to set op=%d, ivlen=%zd, iv=", op, ivlen);
+  if (sendmsg(ctx->sfd, &msg, MSG_MORE) < 0) {
+    fprintf(stderr, "%s: Failed to set op=%d, ivlen=%zd, iv=",
+	    __func__, op, ivlen);
     PrintHex(stderr, iv, ivlen);
-    perror(": ");
+    perror(": sendmsg: ");
     goto err;
   }
   return 1;
@@ -93,32 +120,96 @@ err:
 }
 
 static int CipherUpdate(afalg_ctx *ctx, char *out, size_t *outl,
-			const char* in, size_t inl)
+			const char* in, size_t inl, const char *aad,
+			size_t aadlen, char *tag, int more)
 {
   struct msghdr msg = { 0 };
   struct cmsghdr *cmsg;
-  struct iovec iov;
-  ssize_t nbytes;
+  struct iovec iov[3];
+  ssize_t nbytes, expected;
   int ret = 1;
+  unsigned int i = 0;
+  void *out_aad = NULL;
 
-  iov.iov_base = (void *)in;
-  iov.iov_len = inl;
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  if ((nbytes = send(ctx->sfd, in, inl, MSG_MORE)) != (ssize_t) inl) {
-    fprintf(stderr, "CipherUpdate: sent %zd bytes != inl %zd\n", nbytes, inl);
-    if (nbytes <= 0)
-      return 0;
+  if (aadlen > 0 && (out_aad = malloc(aadlen)) == NULL) {
     ret = 0;
+    goto end;
   }
-  if ((nbytes = read(ctx->sfd, out, (size_t) nbytes)) != (ssize_t) inl) {
-    fprintf(stderr, "CipherUpdate: read %zd bytes != inl %zd\n", nbytes, inl);
-    if (nbytes < 0)
-      return 0;
+  msg.msg_iov = iov;
+  expected = 0;
+  if (aadlen > 0) {
+    iov[i].iov_base = (void *)aad;
+    iov[i++].iov_len = aadlen;
+    expected += aadlen;
+  }
+  if (inl > 0) {
+    iov[i].iov_base = (void *)in;
+    iov[i++].iov_len = inl;
+    expected += inl;
+  }
+  if (ctx->tlen > 0 && !ctx->enc && !more) {
+    iov[i].iov_base = (void *)tag;
+    iov[i++].iov_len = ctx->tlen;
+    expected += ctx->tlen;
+  }
+  msg.msg_iovlen = i;
+  if ((nbytes = sendmsg(ctx->sfd, &msg, more ? MSG_MORE : 0)) 
+      != expected) {
     ret = 0;
+    if (nbytes < 0) {
+      perror(__func__);
+      goto end;
+    }
+    fprintf(stderr, "%s: sendmsg: sent %zd bytes != %zd\n", __func__, nbytes, expected);
   }
+  msg.msg_control = NULL;
+  msg.msg_controllen = 0;
+  i = 0;
+  expected = 0;
+  if (aadlen > 0) {
+    iov[i].iov_base = out_aad;
+    iov[i++].iov_len = aadlen;
+    expected += aadlen;
+  }
+  if (inl > 0) {
+    iov[i].iov_base = (void *)out;
+    iov[i++].iov_len = inl;
+    expected += inl;
+  }
+  if (ctx->tlen > 0 && ctx->enc && !more) {
+    iov[i].iov_base = tag;
+    iov[i++].iov_len = ctx->tlen;
+    expected += ctx->tlen;
+  }
+  msg.msg_iovlen = i;
+  nbytes = 0;
+  if (expected == 0) {
+    // authentication only
+    iov[0].iov_base = &i;
+    iov[0].iov_len = 1;
+    msg.msg_iovlen = 1;
+  }
+  if ((nbytes = recvmsg(ctx->sfd, &msg, 0)) != expected) {
+    ret = 0;
+    fprintf(stderr, "%s: ", __func__);
+    if (nbytes < 0) {
+      if (errno == EBADMSG && !ctx->enc)
+	fprintf(stderr, "Tag   : Authentication Failed.\n");
+      else
+        perror("recvmsg");
+      goto end;
+    }
+    fprintf(stderr, "recvmsg: received %zd bytes != %zd\n", nbytes, expected);
+  }
+  if (nbytes > aadlen)
+    nbytes -= aadlen;
+  else
+    nbytes = 0;
   if (outl != NULL)
     *outl = (size_t) nbytes;
+
+end:
+  free(out_aad);
   return ret;
 }
 
@@ -132,29 +223,38 @@ static int CipherFinal(afalg_ctx *ctx)
 
 static int run_test(const char *cipher, const char *key, size_t keylen,
 		    const char* iv, size_t ivlen, const char *text,
-		    size_t len, int enc, const char *expected, size_t roundlen)
+		    size_t len, int enc, const char *expected, const char *aad,
+		    size_t aadlen, const char *tag, size_t tlen,
+		    size_t roundlen)
 {
   afalg_ctx ctx;
-  char text_out[1024];
-  size_t outl;
+  char text_out[1024], tag_out[64];
+  size_t i = 0, outl = 0;
   int ret = 0;
+  int more;
 
-  if (!CipherInit(&ctx, cipher, key, keylen, iv, ivlen, enc)) {
+  if (!CipherInit(&ctx, cipher, key, keylen, iv, ivlen, tlen, aadlen, enc)) {
     fprintf(stderr, "Error in CipherInit\n");
     return -1;
   }
 
-  for (size_t i = 0; i < len; i += roundlen) {
-    if (i + roundlen > len)
+  do {
+    more = (i + roundlen < len);
+    if (!more)
        roundlen = len - i;
     printf("InText:");
     PrintHex(stdout, text + i, roundlen);
+    if (more)
+      printf(" ...");
     printf("\n");
-    if(!CipherUpdate(&ctx, text_out, &outl, text + i, roundlen)) {
-      fprintf(stderr, "Error in CipherUpdate\n");
+    if(!CipherUpdate(&ctx, text_out, &outl, text + i, roundlen,
+		     aad, aadlen, enc ? tag_out : (char *) tag,
+		     more)) {
       if (outl < 1)
 	return -1;
     }
+    if (tlen > 0 && enc)
+      outl -= tlen;
     printf("Output:");
     PrintHex(stdout, text_out, outl);
     if (memcmp(text_out, expected + i, roundlen)) {
@@ -163,10 +263,22 @@ static int run_test(const char *cipher, const char *key, size_t keylen,
       PrintHex(stdout, expected + i, roundlen);
       printf(": FAILED!\n");
       ret = 1;
-    } else {
-      printf(": PASS\n");
     }
-  }
+    if (tlen > 0) {
+      printf("\nTag   :");
+      PrintHex(stdout, enc ? tag_out : tag, tlen);
+      if (tlen > 0 && enc && memcmp(tag_out, tag, tlen)) {
+        printf(": FAILED!\n");
+        printf("Expect:");
+        PrintHex(stdout, tag, tlen);
+        printf(": FAILED!\n");
+        ret = 1;
+      }
+    }
+    if (ret == 0)
+      printf(": PASS\n");
+    i += roundlen;
+  } while (i < len);
   if (!CipherFinal(&ctx)) {
     fprintf(stderr, "Error in CipherFinal_ex\n");
     return -1;
@@ -176,21 +288,26 @@ static int run_test(const char *cipher, const char *key, size_t keylen,
 
 int main(int argc, char **argv)
 {
-  int ret = 0;
+  int vres;
+  unsigned int vfails = 0, vpasses = 0, tfails = 0, tpasses = 0;
 
-#ifdef FAIL_TEST
-  vectors[FAIL_TEST].ciphertext[vectors[FAIL_TEST].textlen - 2]++;
-#endif
   for (int t = 0; vectors[t].alg; t++) {
+    if (argc > 1 && strncmp(argv[1], vectors[t].alg, CRYPTO_MAX_NAME))
+      continue;
     printf("%s:\n"
 	   "Key   :", vectors[t].desc);
     PrintHex(stdout, vectors[t].key, vectors[t].klen);
     printf("\nIV    :");
     PrintHex(stdout, vectors[t].iv, vectors[t].ivlen);
+    if (vectors[t].aadlen > 0) {
+      printf("\nAAD   :");
+      PrintHex(stdout, vectors[t].aad, vectors[t].aadlen);
+    }
     printf("\n\n");
+    vres = 0;
     for (int n = ((vectors[t].len + vectors[t].blocklen - 1) /
 		  vectors[t].blocklen) * vectors[t].blocklen;
-	 n > 0;
+	 n + vectors[t].tlen > 0;
 	 n -= vectors[t].blocklen) {
       if (n < vectors[t].len) {
         /* rfc3863-mode ciphers are not updating IV on their own,
@@ -199,25 +316,52 @@ int main(int argc, char **argv)
         if (!strncmp(vectors[t].alg, "rfc3686(", 8))
 	  break;
 #endif
-	printf("Running using %d-byte updates\n", n);
+	if (vectors[t].tlen > 0)
+	  break;
+	printf("Running using %d-bytes updates\n", n);
       } else {
 	printf("Running in one-shot\n");
       }
       printf("Encryption:\n");
-      ret |= run_test(vectors[t].alg, vectors[t].key, vectors[t].klen,
-		      vectors[t].iv, vectors[t].ivlen, vectors[t].ptext,
-		      vectors[t].len, 1, vectors[t].ctext, n);
+      if (run_test(vectors[t].alg, vectors[t].key, vectors[t].klen,
+		   vectors[t].iv, vectors[t].ivlen, vectors[t].ptext,
+		   vectors[t].len, 1, vectors[t].ctext,
+		   vectors[t].aad, vectors[t].aadlen,
+		   vectors[t].tag, vectors[t].tlen, n) != 0) {
+	tfails++;
+	vres = 1;
+      } else {
+        tpasses++;
+      }
       printf("Decryption:\n");
-      ret |= run_test(vectors[t].alg, vectors[t].key, vectors[t].klen,
-		      vectors[t].iv, vectors[t].ivlen, vectors[t].ctext,
-		      vectors[t].len, 0, vectors[t].ptext, n);
+      if (run_test(vectors[t].alg, vectors[t].key, vectors[t].klen,
+		   vectors[t].iv, vectors[t].ivlen, vectors[t].ctext,
+		   vectors[t].len, 0, vectors[t].ptext,
+		   vectors[t].aad, vectors[t].aadlen,
+		   vectors[t].tag, vectors[t].tlen, n) != 0) {
+	tfails++;
+	vres = 1;
+      } else {
+	tpasses++;
+      }
       printf("\n");
+      if (vres)
+        vfails++;
+      else
+        vpasses++;
     }
   }
-  if (ret)
+  printf("%3d Tests Vectors Performed: PASS: %3d; FAIL: %3d\n"
+	 "%3d Total Test Runs        : PASS: %3d; FAIL: %3d\n",
+	 vpasses + vfails, vpasses, vfails, tpasses + tfails, tpasses, tfails);
+  if (vfails > 0) {
     printf("There were failed tests.  Check output!\n");
-  else
+  } else if (vpasses > 0) {
     printf("Success! All tests passed!\n");
-  return ret;
+  } else {
+    printf("No tests performed!\n");
+    return -1;
+  }
+  return vfails;
 }
 
