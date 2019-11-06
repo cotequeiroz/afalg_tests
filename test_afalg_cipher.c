@@ -191,19 +191,20 @@ static int CipherUpdate(afalg_ctx *ctx, char *out, size_t *outl,
   }
   if ((nbytes = recvmsg(ctx->sfd, &msg, 0)) != expected) {
     ret = 0;
-    fprintf(stderr, "%s: ", __func__);
     if (nbytes < 0) {
-      if (errno == EBADMSG && !ctx->enc)
-	fprintf(stderr, "Tag   : Authentication Failed.\n");
-      else
+      if (errno == EBADMSG && !ctx->enc) {
+	printf("Tag   : Authentication Failed.\n");
+      } else {
+        fprintf(stderr, "%s: ", __func__);
         perror("recvmsg");
+      }
       goto end;
     }
     fprintf(stderr, "recvmsg: received %zd bytes != %zd\n", nbytes, expected);
   }
   if (nbytes > aadlen)
     nbytes -= aadlen;
-  else
+  else if (nbytes > 0)
     nbytes = 0;
   if (outl != NULL)
     *outl = (size_t) nbytes;
@@ -229,12 +230,12 @@ static int run_test(const char *cipher, const char *key, size_t keylen,
 {
   afalg_ctx ctx;
   char text_out[1024], tag_out[64];
-  size_t i = 0, outl = 0;
+  size_t i = 0, outl = 0, out_tlen;
   int ret = 0;
   int more;
 
   if (!CipherInit(&ctx, cipher, key, keylen, iv, ivlen, tlen, aadlen, enc)) {
-    fprintf(stderr, "Error in CipherInit\n");
+    fprintf(stderr, "Error in CipherInit.  TEST FAILED!\n");
     return -1;
   }
 
@@ -247,14 +248,29 @@ static int run_test(const char *cipher, const char *key, size_t keylen,
     if (more)
       printf(" ...");
     printf("\n");
+    if (!enc && tlen > 0) {
+      printf("Tag   :");
+      PrintHex(stdout, tag, tlen);
+      printf("\n");
+    }
     if(!CipherUpdate(&ctx, text_out, &outl, text + i, roundlen,
 		     aad, aadlen, enc ? tag_out : (char *) tag,
 		     more)) {
-      if (outl < 1)
-	return -1;
+      ret = 1;
+      if (outl < 0) {
+	fprintf(stderr, "Error in CipherUpdate: %s\n", strerror(-outl));
+	outl = 0;
+      }
     }
-    if (tlen > 0 && enc)
-      outl -= tlen;
+    if (tlen > 0 && enc) {
+      if (outl > tlen) {
+	outl -= tlen;
+	out_tlen = tlen;
+      } else {
+	out_tlen = outl;
+	outl = 0;
+      }
+    }
     printf("Output:");
     PrintHex(stdout, text_out, outl);
     if (memcmp(text_out, expected + i, roundlen)) {
@@ -264,10 +280,10 @@ static int run_test(const char *cipher, const char *key, size_t keylen,
       printf(": FAILED!\n");
       ret = 1;
     }
-    if (tlen > 0) {
+    if (enc && tlen > 0) {
       printf("\nTag   :");
-      PrintHex(stdout, enc ? tag_out : tag, tlen);
-      if (tlen > 0 && enc && memcmp(tag_out, tag, tlen)) {
+      PrintHex(stdout, tag_out, out_tlen);
+      if (tlen > 0 && enc && (out_tlen != tlen || memcmp(tag_out, tag, tlen))) {
         printf(": FAILED!\n");
         printf("Expect:");
         PrintHex(stdout, tag, tlen);
@@ -345,11 +361,11 @@ int main(int argc, char **argv)
 	tpasses++;
       }
       printf("\n");
-      if (vres)
-        vfails++;
-      else
-        vpasses++;
     }
+    if (vres)
+      vfails++;
+    else
+      vpasses++;
   }
   printf("%3d Tests Vectors Performed: PASS: %3d; FAIL: %3d\n"
 	 "%3d Total Test Runs        : PASS: %3d; FAIL: %3d\n",
