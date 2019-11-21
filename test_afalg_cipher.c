@@ -307,6 +307,7 @@ int main(int argc, char **argv)
   int vres;
   unsigned int vfails = 0, vpasses = 0, tfails = 0, tpasses = 0;
 
+  setbuf(stdout, NULL);
   for (int t = 0; vectors[t].alg; t++) {
     if (argc > 1 && strncmp(argv[1], vectors[t].alg, CRYPTO_MAX_NAME))
       continue;
